@@ -1581,7 +1581,7 @@ def run():
 
         if not instrument_config.get("enabled", False):
             continue
-
+        log(f"SCAN | {instrument_name}")
         df = get_instrument_data(instrument_config)
 
         if df.empty:
