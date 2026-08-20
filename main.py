@@ -256,6 +256,23 @@ def is_optimal_time():
 # ============================================================
 
 def get_capital():
+    """
+    Return Athena's capital according to the trading mode.
+
+    PAPER mode:
+        Always use configured FALLBACK_CAPITAL.
+
+    LIVE mode:
+        Use the available Dhan balance.
+        Fall back to FALLBACK_CAPITAL if the broker value
+        cannot be obtained.
+    """
+
+    # PAPER mode must never use the broker's real cash balance.
+    if not LIVE_TRADING:
+        return float(FALLBACK_CAPITAL)
+
+    # LIVE mode: obtain actual broker capital.
     if not dhan:
         return float(FALLBACK_CAPITAL)
 
@@ -1947,12 +1964,66 @@ def startup():
 
 
 def main():
+    """
+    Persistent Athena-X worker.
+
+    The worker stays alive continuously:
+      - During market hours: run Athena trading cycles.
+      - Outside market hours: remain idle and wait.
+      - On the next trading session: automatically resume.
+
+    This does NOT change Athena's trading rules or execution logic.
+    """
+
     startup()
 
     while True:
         try:
+            now = datetime.now(IST)
+
+            # ------------------------------------------------
+            # OUTSIDE MARKET HOURS
+            # ------------------------------------------------
+            if not is_market_open():
+                next_open = get_next_market_open()
+
+                if next_open is not None:
+                    seconds_until_open = max(
+                        60,
+                        int((next_open - now).total_seconds()),
+                    )
+
+                    log(
+                        "Market closed. "
+                        f"Next market open: "
+                        f"{next_open.strftime('%Y-%m-%d %H:%M:%S IST')}"
+                    )
+
+                    # Don't sleep for the entire overnight period.
+                    # Wake periodically so the worker remains responsive.
+                    sleep_seconds = min(
+                        seconds_until_open,
+                        300,
+                    )
+
+                    time.sleep(sleep_seconds)
+                    continue
+
+                # No valid upcoming session found.
+                log(
+                    "Market closed and next market open could not "
+                    "be determined. Retrying in 5 minutes."
+                )
+                time.sleep(300)
+                continue
+
+            # ------------------------------------------------
+            # MARKET OPEN
+            # ------------------------------------------------
             run()
             persist_state()
+
+            time.sleep(LOOP_SECONDS)
 
         except KeyboardInterrupt:
             log("ATHENA-X stopped manually.")
@@ -1961,15 +2032,14 @@ def main():
         except Exception as exc:
             error = "Main loop error: " + str(exc)
             log(error)
-            telegram.send_error(error)
+
+            try:
+                telegram.send_error(error)
+            except Exception:
+                pass
+
+            # Keep the worker alive after recoverable errors.
             time.sleep(30)
-
-        if should_exit_market_hours():
-            log("ATHENA-X stopping outside market hours.")
-            break
-
-        time.sleep(LOOP_SECONDS)
-
 
 if __name__ == "__main__":
     main()
