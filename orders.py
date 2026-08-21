@@ -1,3 +1,4 @@
+import math
 """
 Order management for Athena-X - With Trailing Stop-Loss
 """
@@ -30,10 +31,24 @@ def get_option_ltp(option):
 
 def get_option_delta(option):
     try:
-        val = safe_get(option, ['delta'])
-        return float(val) if val else 0
-    except Exception:
-        return 0
+        if not isinstance(option, dict):
+            return 0.0
+
+        greeks = option.get("greeks", {})
+
+        if isinstance(greeks, dict):
+            val = greeks.get("delta")
+
+            if val is not None:
+                return float(val)
+
+        # Compatibility with flat option-chain formats.
+        val = safe_get(option, ["delta"])
+
+        return float(val) if val is not None else 0.0
+
+    except (TypeError, ValueError):
+        return 0.0
 
 def get_option_oi(option):
     try:
@@ -178,162 +193,439 @@ def calculate_trade_params(
     }
 
 def select_best_option(chain_df, market, instrument_name="NIFTY"):
-    if chain_df.empty:
+    """
+    Select the best option contract from the supplied option chain.
+
+    Selection hierarchy:
+        1. Direction determines CE/PE.
+        2. ATM and expected-move target define the preferred strike region.
+        3. Delta and liquidity are hard filters.
+        4. Remaining candidates are ranked using target proximity,
+           delta quality, ATM proximity, OI, volume and spread.
+
+    The returned candidate structure is kept compatible with the
+    downstream trade/execution pipeline.
+    """
+    from logger import log
+
+    if chain_df is None or chain_df.empty:
         return None
 
-    current_price = market['price']
-    predicted_move = market.get('expected_move', current_price * 0.01)
-    direction = market['direction']
+    if not isinstance(market, dict):
+        return None
 
-    if direction == 'BULLISH':
-        predicted_target = current_price + predicted_move
-        option_type = 'CE'
+    try:
+        current_price = float(market.get("price", 0))
+    except (TypeError, ValueError):
+        return None
+
+    if current_price <= 0:
+        return None
+
+    direction = str(
+        market.get("direction", "")
+    ).upper()
+
+    if direction == "BULLISH":
+        option_type = "CE"
+        direction_sign = 1.0
+    elif direction == "BEARISH":
+        option_type = "PE"
+        direction_sign = -1.0
     else:
-        predicted_target = current_price - predicted_move
-        option_type = 'PE'
+        log(
+            f"OPTION FILTER | {instrument_name} | "
+            f"invalid market direction={direction}"
+        )
+        return None
+
+    # ------------------------------------------------------------
+    # Expected move
+    # ------------------------------------------------------------
+
+    try:
+        expected_move = float(
+            market.get(
+                "expected_move",
+                current_price * 0.01,
+            )
+        )
+    except (TypeError, ValueError):
+        expected_move = current_price * 0.01
+
+    # Prevent a bad/zero ATR from collapsing the target.
+    if expected_move <= 0:
+        expected_move = current_price * 0.01
+
+    # Do not allow an extreme model move to push the target
+    # unrealistically far away from ATM.
+    expected_move = min(
+        expected_move,
+        current_price * 0.02,
+    )
+
+    predicted_target = (
+        current_price
+        + direction_sign * expected_move
+    )
+
+    # ------------------------------------------------------------
+    # ATM / target strikes
+    # ------------------------------------------------------------
+
+    try:
+        strikes = sorted(
+            float(x)
+            for x in chain_df["strike"]
+            if x is not None
+        )
+    except (TypeError, ValueError):
+        return None
+
+    if not strikes:
+        return None
 
     atm_strike = min(
-        chain_df['strike'],
+        strikes,
         key=lambda x: abs(x - current_price),
     )
+
     target_strike = min(
-        chain_df['strike'],
+        strikes,
         key=lambda x: abs(x - predicted_target),
     )
 
-    strike_step = 100 if instrument_name == "BANKNIFTY" else 50
+    # Infer strike spacing from the actual chain instead of relying
+    # exclusively on instrument-specific hard-coding.
+    unique_strikes = sorted(set(strikes))
+
+    strike_differences = [
+        unique_strikes[i + 1] - unique_strikes[i]
+        for i in range(len(unique_strikes) - 1)
+        if unique_strikes[i + 1] > unique_strikes[i]
+    ]
+
+    if strike_differences:
+        strike_step = min(strike_differences)
+    else:
+        strike_step = (
+            100.0
+            if instrument_name == "BANKNIFTY"
+            else 50.0
+        )
+
+    if strike_step <= 0:
+        strike_step = (
+            100.0
+            if instrument_name == "BANKNIFTY"
+            else 50.0
+        )
+
+    # ------------------------------------------------------------
+    # Adaptive candidate window
+    # ------------------------------------------------------------
+    #
+    # Instead of rejecting everything outside ATM ± 2 strikes,
+    # allow a region based on the expected move.
+    #
+    # Minimum window:
+    #     4 strike steps from ATM
+    #
+    # Maximum window:
+    #     8 strike steps from ATM
+    #
+    # This keeps the search local without making the selector
+    # excessively restrictive.
+    # ------------------------------------------------------------
+
+    move_steps = expected_move / strike_step
+
+    search_steps = max(
+        4.0,
+        min(8.0, move_steps * 1.5),
+    )
+
+    max_distance = strike_step * search_steps
+
     candidates = []
+
     rejected_liquidity = 0
     rejected_delta = 0
     rejected_distance = 0
+    invalid_contracts = 0
+
+    # ------------------------------------------------------------
+    # Candidate evaluation
+    # ------------------------------------------------------------
 
     for idx in range(len(chain_df)):
         row = chain_df.iloc[idx]
-        strike = float(row['strike'])
 
-        distance_to_atm = abs(strike - atm_strike)
-        distance_to_target = abs(strike - target_strike)
+        try:
+            strike = float(row["strike"])
+        except (TypeError, ValueError, KeyError):
+            invalid_contracts += 1
+            continue
 
+        distance_to_atm = abs(
+            strike - atm_strike
+        )
+
+        distance_to_target = abs(
+            strike - target_strike
+        )
+
+        # Adaptive distance gate.
+        #
+        # Target proximity is allowed to override ATM distance
+        # when the expected move is large enough.
         if (
-            distance_to_atm > strike_step * 2
-            and distance_to_target > strike_step * 2
+            distance_to_atm > max_distance
+            and distance_to_target > max_distance
         ):
             rejected_distance += 1
             continue
 
-        option = row['ce'] if option_type == 'CE' else row['pe']
+        if option_type == "CE":
+            option = (
+                row.get("ce")
+                if hasattr(row, "get")
+                else row["ce"]
+            )
+        else:
+            option = (
+                row.get("pe")
+                if hasattr(row, "get")
+                else row["pe"]
+            )
+
+        if not isinstance(option, dict):
+            invalid_contracts += 1
+            continue
 
         ltp = get_option_ltp(option)
         delta = get_option_delta(option)
         security_id = get_option_security_id(option)
         oi = get_option_oi(option)
 
-        if ltp <= 0 or delta == 0 or not security_id:
+        if (
+            ltp <= 0
+            or delta == 0
+            or not security_id
+        ):
+            invalid_contracts += 1
             continue
 
-        if not (MIN_DELTA <= abs(delta) <= MAX_DELTA):
+        abs_delta = abs(delta)
+
+        # --------------------------------------------------------
+        # Delta hard filter
+        # --------------------------------------------------------
+
+        if not (
+            MIN_DELTA
+            <= abs_delta
+            <= MAX_DELTA
+        ):
             rejected_delta += 1
             continue
 
-        liquid, liquidity = option_liquidity_check(option)
+        # --------------------------------------------------------
+        # Liquidity hard filter
+        # --------------------------------------------------------
+
+        liquid, liquidity = option_liquidity_check(
+            option
+        )
+
         if not liquid:
             rejected_liquidity += 1
             continue
 
-        distance_to_target_score = max(
-            0,
-            100 - (distance_to_target / strike_step * 15),
-        )
-        atm_bonus = max(
-            0,
-            10 - (distance_to_atm / strike_step * 5),
-        )
-        oi_score = min(20, oi / 10000)
-        delta_score = 50 - abs(delta - 0.50) * 50
+        # --------------------------------------------------------
+        # Normalised scoring
+        # --------------------------------------------------------
 
-        # Small liquidity-quality bonus, capped so liquidity never dominates
-        # direction/delta/target selection.
+        distance_target_steps = (
+            distance_to_target / strike_step
+        )
+
+        distance_atm_steps = (
+            distance_to_atm / strike_step
+        )
+
+        # Target proximity:
+        # 40 points maximum.
+        target_score = max(
+            0.0,
+            40.0
+            - distance_target_steps * 5.0,
+        )
+
+        # ATM proximity:
+        # 15 points maximum.
+        atm_score = max(
+            0.0,
+            15.0
+            - distance_atm_steps * 2.5,
+        )
+
+        # Delta:
+        # Prefer approximately 0.50 delta while allowing
+        # the configured 0.35-0.70 range.
+        delta_score = max(
+            0.0,
+            25.0
+            - abs(abs_delta - 0.50) * 50.0,
+        )
+
+        # OI:
+        # Logarithmic scaling prevents huge OI contracts from
+        # completely dominating the ranking.
+        oi_value = max(
+            0.0,
+            float(oi),
+        )
+
+        oi_score = min(
+            10.0,
+            math.log10(
+                oi_value + 1.0
+            ) * 2.0,
+        )
+
+        # Volume.
+        volume = max(
+            0.0,
+            float(
+                liquidity.get(
+                    "volume",
+                    get_option_volume(option),
+                )
+            ),
+        )
+
         volume_score = min(
-            10,
-            liquidity['volume'] / 5000,
+            5.0,
+            math.log10(
+                volume + 1.0
+            ),
+        )
+
+        # Spread.
+        spread_pct = liquidity.get(
+            "spread_pct"
         )
 
         spread_penalty = 0.0
-        if liquidity['spread_pct'] is not None:
+
+        if spread_pct is not None:
+            try:
+                spread_pct = float(
+                    spread_pct
+                )
+            except (TypeError, ValueError):
+                spread_pct = None
+
+        if (
+            spread_pct is not None
+            and MAX_OPTION_SPREAD_PCT > 0
+        ):
             spread_penalty = min(
-                10,
-                (liquidity['spread_pct'] / MAX_OPTION_SPREAD_PCT) * 10,
+                10.0,
+                (
+                    spread_pct
+                    / MAX_OPTION_SPREAD_PCT
+                ) * 10.0,
             )
 
         total_score = (
-            distance_to_target_score
-            + atm_bonus
-            + oi_score
+            target_score
+            + atm_score
             + delta_score
+            + oi_score
             + volume_score
             - spread_penalty
         )
 
         candidates.append({
-            'strike': strike,
-            'option_type': option_type,
-            'security_id': security_id,
-            'entry_price': ltp,
-            'delta': abs(delta),
-            'score': total_score,
-            'oi': oi,
-            'volume': liquidity['volume'],
-            'bid': liquidity['bid'],
-            'ask': liquidity['ask'],
-            'spread_pct': liquidity['spread_pct'],
-            'instrument': instrument_name,
+            "strike": strike,
+            "option_type": option_type,
+            "security_id": security_id,
+            "entry_price": ltp,
+            "delta": abs_delta,
+            "score": total_score,
+            "oi": oi,
+            "volume": volume,
+            "bid": liquidity.get("bid"),
+            "ask": liquidity.get("ask"),
+            "spread_pct": spread_pct,
+            "instrument": instrument_name,
+            "atm_strike": atm_strike,
+            "target_strike": target_strike,
+            "expected_move": expected_move,
         })
 
-    from logger import log
+    # ------------------------------------------------------------
+    # Diagnostics
+    # ------------------------------------------------------------
 
     log(
-        f"OPTION FILTER | {instrument_name} {option_type} | "
-        f"rows={len(chain_df)} | candidates={len(candidates)} | "
+        f"OPTION FILTER | "
+        f"{instrument_name} {option_type} | "
+        f"rows={len(chain_df)} | "
+        f"candidates={len(candidates)} | "
         f"distance_reject={rejected_distance} | "
         f"delta_reject={rejected_delta} | "
-        f"liquidity_reject={rejected_liquidity}"
+        f"liquidity_reject={rejected_liquidity} | "
+        f"invalid={invalid_contracts} | "
+        f"ATM={atm_strike} | "
+        f"TARGET={target_strike} | "
+        f"STEP={strike_step} | "
+        f"WINDOW={search_steps:.1f}"
     )
 
+    if not candidates:
+        return None
+
+    # Highest score wins.
     candidates.sort(
-        key=lambda x: x['score'],
+        key=lambda x: x["score"],
         reverse=True,
     )
 
-    if candidates:
-        best = candidates[0]
-        log(
-            "Selected: "
-            + instrument_name
-            + " "
-            + option_type
-            + " "
-            + str(best['strike'])
-            + " | ATM: "
-            + str(atm_strike)
-            + " | Target: "
-            + str(target_strike)
-            + " | Delta: "
-            + str(best['delta'])
-            + " | OI: "
-            + str(best['oi'])
-            + " | Volume: "
-            + str(best['volume'])
-            + " | Spread: "
-            + (
-                "NA"
-                if best['spread_pct'] is None
-                else f"{best['spread_pct']:.2%}"
-            )
+    best = candidates[0]
+
+    log(
+        "Selected: "
+        + instrument_name
+        + " "
+        + option_type
+        + " "
+        + str(best["strike"])
+        + " | ATM: "
+        + str(atm_strike)
+        + " | Target: "
+        + str(target_strike)
+        + " | Expected move: "
+        + f"{expected_move:.2f}"
+        + " | Delta: "
+        + f"{best['delta']:.3f}"
+        + " | OI: "
+        + str(best["oi"])
+        + " | Volume: "
+        + str(best["volume"])
+        + " | Spread: "
+        + (
+            "NA"
+            if best["spread_pct"] is None
+            else f"{best['spread_pct']:.2%}"
         )
-        return best
+        + " | Score: "
+        + f"{best['score']:.2f}"
+    )
 
-    return None
-
+    return best
 
 def execute_trade(dhan, market, candidate, trade, logger, state, ml_engine=None):
     from logger import log
