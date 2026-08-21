@@ -1,16 +1,29 @@
 """
 ATHENA-X Quantitative Risk Engine
 ---------------------------------
-Mathematical layer between XGBoost and order execution.
 
-Responsibilities:
-- market-regime classification
-- expected-value calculation
-- fractional Kelly sizing
-- drawdown risk throttling
-- hard exposure/risk validation
+Isolated quantitative decision and risk layer between:
 
-This module never places orders.
+    Market Analysis
+          ↓
+       XGBoost
+          ↓
+    Risk Engine
+          ↓
+    Order Sizing
+
+This module NEVER places orders.
+
+Design goals:
+- Preserve Athena's existing public interfaces.
+- Keep regime classification independent from order execution.
+- Avoid treating indicator direction as certainty.
+- Use ATR-normalized trend strength.
+- Separate trade approval from position sizing.
+- Apply hard drawdown and risk limits.
+- Never allow zero-edge trades to receive full risk.
+- Keep probability handling conservative when ML is unavailable.
+- Keep all calculations deterministic and lightweight.
 """
 
 from __future__ import annotations
@@ -36,163 +49,459 @@ from config import (
 )
 
 
+# ============================================================
+# NUMERIC HELPERS
+# ============================================================
+
 def _finite(value, default=0.0):
+    """
+    Convert a value to a finite float.
+
+    Invalid, missing, NaN and infinite values become default.
+    """
     try:
         value = float(value)
-        return value if math.isfinite(value) else default
+
+        if math.isfinite(value):
+            return value
+
+        return default
+
     except (TypeError, ValueError):
         return default
 
 
 def clamp(value, low=0.0, high=1.0):
-    return max(low, min(high, _finite(value)))
+    """
+    Clamp a numeric value into [low, high].
+    """
+    value = _finite(value)
 
+    low = _finite(low)
+    high = _finite(high)
+
+    if low > high:
+        low, high = high, low
+
+    return max(low, min(high, value))
+
+
+def _safe_ratio(numerator, denominator, default=0.0):
+    """
+    Safe division helper.
+    """
+    numerator = _finite(numerator)
+    denominator = _finite(denominator)
+
+    if denominator == 0:
+        return default
+
+    return numerator / denominator
+
+
+# ============================================================
+# MARKET REGIME
+# ============================================================
 
 def classify_regime(market):
     """
-    Classify the underlying market into a small number of robust regimes.
+    Classify the current underlying market regime.
 
-    The classification deliberately uses measurements already produced by
-    Athena instead of adding a large collection of new indicators.
+    The classification uses measurements Athena already calculates:
+
+        ADX
+        ATR%
+        EMA20
+        EMA50
+        price
+
+    The important improvement is that EMA separation is considered
+    relative to ATR rather than relying only on an absolute percentage.
+
+    Possible regimes:
+
+        HIGH_VOL
+        LOW_VOL_RANGE
+        TRENDING
+        RANGING
+        NORMAL
+        UNKNOWN
     """
+
     if not isinstance(market, dict):
         return "UNKNOWN"
 
-    adx = _finite(market.get("adx"))
-    atr_percent = _finite(
-        market.get(
-            "atr_percent",
-            (
-                _finite(market.get("atr"))
-                / _finite(market.get("price"), 1.0)
-                * 100.0
-            ),
-        )
-    )
-
     price = _finite(market.get("price"))
+
+    if price <= 0:
+        return "UNKNOWN"
+
+    adx = _finite(market.get("adx"))
+
+    atr = _finite(market.get("atr"))
+
+    atr_percent = market.get("atr_percent")
+
+    if atr_percent is None:
+        atr_percent = _safe_ratio(
+            atr,
+            price,
+            0.0,
+        ) * 100.0
+
+    atr_percent = max(0.0, _finite(atr_percent))
+
     ema20 = _finite(market.get("ema20"))
     ema50 = _finite(market.get("ema50"))
+    ema200 = _finite(market.get("ema200"))
 
-    ema_spread = (
-        abs(ema20 - ema50) / price * 100.0
+    # --------------------------------------------------------
+    # ATR-normalized EMA separation
+    # --------------------------------------------------------
+
+    ema_distance = abs(ema20 - ema50)
+
+    if atr > 0:
+        ema_spread_atr = ema_distance / atr
+    else:
+        ema_spread_atr = 0.0
+
+    # Existing configuration threshold is retained for
+    # compatibility, but we also require meaningful ATR-relative
+    # separation before calling something a strong trend.
+    configured_spread = max(
+        0.0,
+        _finite(TREND_EMA_SPREAD_PCT),
+    )
+
+    configured_spread_fraction = (
+        configured_spread / 100.0
+    )
+
+    percentage_spread = (
+        ema_distance / price
         if price > 0
         else 0.0
     )
 
+    percentage_trend_ok = (
+        percentage_spread >= configured_spread_fraction
+    )
+
+    atr_trend_ok = ema_spread_atr >= 0.50
+
+    # Require either:
+    #
+    #   - configured percentage separation
+    #   OR
+    #   - meaningful separation relative to ATR.
+    #
+    # This prevents tiny EMA differences from being treated
+    # as a strong directional trend.
+
+    trend_structure_ok = (
+        percentage_trend_ok
+        or atr_trend_ok
+    )
+
+    # --------------------------------------------------------
+    # High volatility
+    # --------------------------------------------------------
+
     if atr_percent >= HIGH_VOL_ATR_PCT:
         return "HIGH_VOL"
 
-    if atr_percent <= LOW_VOL_ATR_PCT and adx < TREND_ADX_THRESHOLD:
+    # --------------------------------------------------------
+    # Low-volatility range
+    # --------------------------------------------------------
+
+    if (
+        atr_percent <= LOW_VOL_ATR_PCT
+        and adx < TREND_ADX_THRESHOLD
+    ):
         return "LOW_VOL_RANGE"
+
+    # --------------------------------------------------------
+    # Strong directional trend
+    # --------------------------------------------------------
 
     if (
         adx >= TREND_ADX_THRESHOLD
-        and ema_spread >= TREND_EMA_SPREAD_PCT
+        and trend_structure_ok
     ):
         return "TRENDING"
+
+    # --------------------------------------------------------
+    # Range
+    # --------------------------------------------------------
 
     if adx <= RANGE_ADX_THRESHOLD:
         return "RANGING"
 
+    # --------------------------------------------------------
+    # Everything between range and trend
+    # --------------------------------------------------------
+
     return "NORMAL"
 
+
+# ============================================================
+# DRAWDOWN CONTROL
+# ============================================================
 
 def drawdown_multiplier(drawdown_pct):
     """
     Convert current equity drawdown into a risk multiplier.
 
-    0% to 2% drawdown: full risk.
-    2% to 8%: linearly reduce risk.
-    >=8%: no new risk.
-    """
-    drawdown = max(0.0, _finite(drawdown_pct))
+    Behaviour:
 
-    if drawdown >= DRAWDOWN_STOP_PCT:
+        0% → full risk
+
+        <= DRAWDOWN_FULL_RISK_PCT
+             → 1.0
+
+        Between FULL_RISK and STOP
+             → progressively reduce risk
+
+        >= DRAWDOWN_STOP_PCT
+             → 0.0
+    """
+
+    drawdown = max(
+        0.0,
+        _finite(drawdown_pct),
+    )
+
+    full_risk = max(
+        0.0,
+        _finite(DRAWDOWN_FULL_RISK_PCT),
+    )
+
+    stop = max(
+        full_risk,
+        _finite(DRAWDOWN_STOP_PCT),
+    )
+
+    if drawdown >= stop:
         return 0.0
 
-    if drawdown <= DRAWDOWN_FULL_RISK_PCT:
+    if drawdown <= full_risk:
         return 1.0
 
-    span = DRAWDOWN_STOP_PCT - DRAWDOWN_FULL_RISK_PCT
+    span = stop - full_risk
+
+    if span <= 0:
+        return 0.0
+
     progress = (
-        (drawdown - DRAWDOWN_FULL_RISK_PCT) / span
-        if span > 0
-        else 1.0
+        (drawdown - full_risk)
+        / span
+    )
+
+    reduction_limit = clamp(
+        MAX_DRAWDOWN_RISK_REDUCTION,
+        0.0,
+        1.0,
     )
 
     reduction = min(
-        MAX_DRAWDOWN_RISK_REDUCTION,
-        progress * MAX_DRAWDOWN_RISK_REDUCTION,
+        reduction_limit,
+        progress * reduction_limit,
     )
 
-    return max(0.0, 1.0 - reduction)
+    return max(
+        0.0,
+        1.0 - reduction,
+    )
 
+
+# ============================================================
+# REGIME RISK
+# ============================================================
 
 def regime_risk_multiplier(regime):
     """
-    Reduce risk in adverse regimes rather than rejecting every setup.
+    Convert market regime into a risk multiplier.
 
-    The final hard risk ceiling still applies.
+    This does NOT determine whether a trade is correct.
+
+    It only determines how aggressively capital may be exposed
+    if the trade otherwise passes the quantitative checks.
     """
-    return {
+
+    regime = str(
+        regime or "UNKNOWN"
+    ).upper()
+
+    multipliers = {
+        # Strong directional conditions are the most favourable
+        # for directional option buying.
         "TRENDING": 1.00,
-        "NORMAL": 0.90,
-        "RANGING": 0.65,
-        "LOW_VOL_RANGE": 0.50,
-        "HIGH_VOL": 0.50,
+
+        # Transitional conditions receive slightly less exposure.
+        "NORMAL": 0.75,
+
+        # Range conditions are less attractive for directional
+        # option trades.
+        "RANGING": 0.50,
+
+        "LOW_VOL_RANGE": 0.35,
+
+        # High volatility can create both opportunity and
+        # execution risk, so exposure is reduced.
+        "HIGH_VOL": 0.35,
+
+        # Unknown conditions should never receive risk.
         "UNKNOWN": 0.00,
-    }.get(regime, 0.50)
+    }
+
+    return multipliers.get(
+        regime,
+        0.00,
+    )
 
 
-def expected_value(probability, reward, risk, costs=0.0):
+# ============================================================
+# EXPECTED VALUE
+# ============================================================
+
+def expected_value(
+    probability,
+    reward,
+    risk,
+    costs=0.0,
+):
     """
     Expected monetary value:
 
-        EV = P(win)*Reward - P(loss)*Risk - Costs
-
-    Returns a monetary value.
+        EV =
+            P(win) * Reward
+            -
+            P(loss) * Risk
+            -
+            Costs
     """
-    p = clamp(probability)
-    reward = max(0.0, _finite(reward))
-    risk = max(0.0, _finite(risk))
-    costs = max(0.0, _finite(costs))
 
-    return p * reward - (1.0 - p) * risk - costs
+    p = clamp(
+        probability,
+        0.0,
+        1.0,
+    )
+
+    reward = max(
+        0.0,
+        _finite(reward),
+    )
+
+    risk = max(
+        0.0,
+        _finite(risk),
+    )
+
+    costs = max(
+        0.0,
+        _finite(costs),
+    )
+
+    return (
+        p * reward
+        -
+        (1.0 - p) * risk
+        -
+        costs
+    )
 
 
-def expected_value_per_risk(probability, reward, risk, costs=0.0):
-    """Normalize EV by risk so trades are comparable."""
-    risk = max(0.0, _finite(risk))
+def expected_value_per_risk(
+    probability,
+    reward,
+    risk,
+    costs=0.0,
+):
+    """
+    Normalize expected value by the amount being risked.
+    """
+
+    risk = max(
+        0.0,
+        _finite(risk),
+    )
 
     if risk <= 0:
         return float("-inf")
 
-    return expected_value(probability, reward, risk, costs) / risk
+    return (
+        expected_value(
+            probability,
+            reward,
+            risk,
+            costs,
+        )
+        / risk
+    )
 
 
-def kelly_fraction(probability, reward, risk):
+# ============================================================
+# KELLY
+# ============================================================
+
+def kelly_fraction(
+    probability,
+    reward,
+    risk,
+):
     """
-    Calculate the theoretical Kelly fraction.
+    Calculate theoretical Kelly fraction.
 
-    This is never used raw. Athena applies KELLY_FRACTION and a hard cap.
+    This is NOT used raw.
+
+    Athena applies:
+        KELLY_FRACTION
+
+    and:
+        MAX_KELLY_RISK_PCT
     """
-    p = clamp(probability)
-    reward = max(0.0, _finite(reward))
-    risk = max(0.0, _finite(risk))
+
+    p = clamp(
+        probability,
+        0.0,
+        1.0,
+    )
+
+    reward = max(
+        0.0,
+        _finite(reward),
+    )
+
+    risk = max(
+        0.0,
+        _finite(risk),
+    )
 
     if reward <= 0 or risk <= 0:
         return 0.0
 
     b = reward / risk
-    q = 1.0 - p
 
     if b <= 0:
         return 0.0
 
-    raw = ((b * p) - q) / b
-    return max(0.0, min(1.0, raw))
+    q = 1.0 - p
 
+    raw = (
+        (b * p) - q
+    ) / b
+
+    return clamp(
+        raw,
+        0.0,
+        1.0,
+    )
+
+
+# ============================================================
+# PROBABILITY
+# ============================================================
 
 def effective_probability(
     ml_probability,
@@ -202,16 +511,103 @@ def effective_probability(
     """
     Produce the probability used by the quantitative layer.
 
-    Trained XGBoost gets priority.
-    Before ML is trained, market confidence is used conservatively and
-    capped so the system cannot become overconfident without a model.
-    """
-    if ml_trained:
-        return clamp(ml_probability, 0.01, 0.99)
+    IMPORTANT:
 
-    confidence = clamp(market_confidence, 0.50, 0.60)
+    If XGBoost is not trained, Athena must NOT turn technical
+    confidence into an unrealistic probability.
+
+    Therefore pre-ML confidence is capped at 60%.
+
+    When ML is trained, its probability is used, but constrained
+    to avoid mathematically extreme 0/1 probabilities.
+    """
+
+    if ml_trained:
+        probability = clamp(
+            ml_probability,
+            0.01,
+            0.99,
+        )
+
+        return probability
+
+    # No trained model:
+    #
+    # Market confidence is useful as a signal-strength measure,
+    # but it is not a statistically validated win probability.
+    #
+    # Keep it conservative.
+    confidence = clamp(
+        market_confidence,
+        0.50,
+        0.60,
+    )
+
     return confidence
 
+
+# ============================================================
+# COST MODEL
+# ============================================================
+
+def estimate_trade_costs(
+    reward,
+    risk,
+    extra_costs=0.0,
+):
+    """
+    Estimate normalized transaction/friction costs.
+
+    The function intentionally remains lightweight because the
+    actual option execution price is handled elsewhere.
+    """
+
+    reward = max(
+        0.0,
+        _finite(reward),
+    )
+
+    risk = max(
+        0.0,
+        _finite(risk),
+    )
+
+    extra_costs = max(
+        0.0,
+        _finite(extra_costs),
+    )
+
+    notional_proxy = max(
+        reward,
+        risk,
+    )
+
+    slippage = (
+        notional_proxy
+        * max(
+            0.0,
+            _finite(SLIPPAGE_PCT),
+        )
+    )
+
+    transaction = (
+        notional_proxy
+        * max(
+            0.0,
+            _finite(TRANSACTION_COST_PCT),
+        )
+    )
+
+    return (
+        slippage
+        + transaction
+        + extra_costs
+    )
+
+
+# ============================================================
+# TRADE EVALUATION
+# ============================================================
 
 def evaluate_trade(
     probability,
@@ -222,11 +618,109 @@ def evaluate_trade(
     estimated_costs=0.0,
 ):
     """
-    Evaluate a candidate trade without executing it.
+    Evaluate a candidate trade.
 
-    Returns a complete mathematical decision record.
+    This function does NOT:
+
+        - place an order
+        - modify account state
+        - modify database state
+        - modify global state
+
+    It only returns a decision record.
     """
-    regime = classify_regime(market)
+
+    # --------------------------------------------------------
+    # Normalize inputs
+    # --------------------------------------------------------
+
+    probability = clamp(
+        probability,
+        0.0,
+        1.0,
+    )
+
+    reward = max(
+        0.0,
+        _finite(reward),
+    )
+
+    risk = max(
+        0.0,
+        _finite(risk),
+    )
+
+    estimated_costs = max(
+        0.0,
+        _finite(estimated_costs),
+    )
+
+    # --------------------------------------------------------
+    # Regime
+    # --------------------------------------------------------
+
+    regime = classify_regime(
+        market
+    )
+
+    regime_mult = regime_risk_multiplier(
+        regime
+    )
+
+    drawdown_mult = drawdown_multiplier(
+        drawdown_pct
+    )
+
+    total_risk_multiplier = (
+        regime_mult
+        * drawdown_mult
+    )
+
+    # --------------------------------------------------------
+    # Hard input validation FIRST
+    # --------------------------------------------------------
+
+    if risk <= 0:
+        return {
+            "approved": False,
+            "reason": "INVALID_RISK",
+            "regime": regime,
+            "probability": probability,
+            "reward": reward,
+            "risk": risk,
+            "costs": estimated_costs,
+            "expected_value": float("-inf"),
+            "expected_value_per_risk": float("-inf"),
+            "kelly_fraction": 0.0,
+            "fractional_kelly": 0.0,
+            "drawdown_multiplier": drawdown_mult,
+            "regime_multiplier": regime_mult,
+            "risk_multiplier": total_risk_multiplier,
+            "max_kelly_risk_pct": MAX_KELLY_RISK_PCT,
+        }
+
+    if reward <= 0:
+        return {
+            "approved": False,
+            "reason": "INVALID_REWARD",
+            "regime": regime,
+            "probability": probability,
+            "reward": reward,
+            "risk": risk,
+            "costs": estimated_costs,
+            "expected_value": float("-inf"),
+            "expected_value_per_risk": float("-inf"),
+            "kelly_fraction": 0.0,
+            "fractional_kelly": 0.0,
+            "drawdown_multiplier": drawdown_mult,
+            "regime_multiplier": regime_mult,
+            "risk_multiplier": total_risk_multiplier,
+            "max_kelly_risk_pct": MAX_KELLY_RISK_PCT,
+        }
+
+    # --------------------------------------------------------
+    # EV
+    # --------------------------------------------------------
 
     ev = expected_value(
         probability,
@@ -235,12 +729,15 @@ def evaluate_trade(
         estimated_costs,
     )
 
-    ev_per_risk = expected_value_per_risk(
-        probability,
-        reward,
-        risk,
-        estimated_costs,
+    ev_per_risk = (
+        ev / risk
+        if risk > 0
+        else float("-inf")
     )
+
+    # --------------------------------------------------------
+    # Kelly
+    # --------------------------------------------------------
 
     kelly = kelly_fraction(
         probability,
@@ -248,10 +745,66 @@ def evaluate_trade(
         risk,
     )
 
-    drawdown_mult = drawdown_multiplier(drawdown_pct)
-    regime_mult = regime_risk_multiplier(regime)
+    fractional_kelly = (
+        kelly
+        * clamp(
+            KELLY_FRACTION,
+            0.0,
+            1.0,
+        )
+    )
+def timeframe_alignment(
+    entry_direction,
+    regime_direction,
+    regime=None,
+):
+    """
+    Compare the short-term entry direction with the higher-timeframe
+    regime direction.
 
-    total_risk_multiplier = drawdown_mult * regime_mult
+    Returns a decision label only. It does not execute or size trades.
+    """
+
+    entry = str(entry_direction or "").upper()
+    regime_direction = str(regime_direction or "").upper()
+    regime = str(regime or "").upper()
+
+    if entry not in {"BULLISH", "BEARISH"}:
+        return {
+            "aligned": False,
+            "action": "WAIT",
+            "reason": "INVALID_ENTRY_DIRECTION",
+        }
+
+    if regime_direction not in {"BULLISH", "BEARISH"}:
+        return {
+            "aligned": False,
+            "action": "WAIT",
+            "reason": "INVALID_REGIME_DIRECTION",
+        }
+
+    if regime in {"UNKNOWN", ""}:
+        return {
+            "aligned": False,
+            "action": "WAIT",
+            "reason": "UNKNOWN_REGIME",
+        }
+
+    if entry == regime_direction:
+        return {
+            "aligned": True,
+            "action": "PROCEED",
+            "reason": "TIMEFRAME_ALIGNED",
+        }
+
+    return {
+        "aligned": False,
+        "action": "WAIT",
+        "reason": "TIMEFRAME_CONFLICT",
+    }
+    # --------------------------------------------------------
+    # Approval gates
+    # --------------------------------------------------------
 
     approved = True
     reason = "APPROVED"
@@ -264,32 +817,55 @@ def evaluate_trade(
         approved = False
         reason = "DRAWDOWN_STOP"
 
+    elif regime_mult <= 0:
+        approved = False
+        reason = "REGIME_REJECTED"
+
     elif ev_per_risk < EV_MIN_PER_RISK:
         approved = False
         reason = "NEGATIVE_OR_WEAK_EV"
 
-    elif risk <= 0 or reward <= 0:
+    elif kelly <= 0:
+        # Critical safety improvement:
+        #
+        # A zero Kelly fraction means the probability/reward/risk
+        # combination does not justify risking capital.
+        #
+        # The old implementation could still allow hard risk when
+        # Kelly was zero. That is undesirable.
         approved = False
-        reason = "INVALID_REWARD_RISK"
+        reason = "NO_POSITIVE_KELLY_EDGE"
 
     return {
         "approved": approved,
         "reason": reason,
+
         "regime": regime,
-        "probability": clamp(probability),
-        "reward": max(0.0, _finite(reward)),
-        "risk": max(0.0, _finite(risk)),
-        "costs": max(0.0, _finite(estimated_costs)),
+
+        "probability": probability,
+
+        "reward": reward,
+        "risk": risk,
+        "costs": estimated_costs,
+
         "expected_value": ev,
         "expected_value_per_risk": ev_per_risk,
+
         "kelly_fraction": kelly,
-        "fractional_kelly": kelly * KELLY_FRACTION,
+        "fractional_kelly": fractional_kelly,
+
         "drawdown_multiplier": drawdown_mult,
         "regime_multiplier": regime_mult,
+
         "risk_multiplier": total_risk_multiplier,
+
         "max_kelly_risk_pct": MAX_KELLY_RISK_PCT,
     }
 
+
+# ============================================================
+# POSITION SIZING
+# ============================================================
 
 def calculate_position_size(
     capital,
@@ -302,17 +878,71 @@ def calculate_position_size(
     drawdown_pct=0.0,
 ):
     """
-    Calculate quantity using hard risk, regime throttling and fractional Kelly.
+    Calculate option quantity using:
 
-    Returns quantity/lot information plus the actual risk.
+        account capital
+        stop distance
+        Kelly edge
+        regime risk
+        drawdown risk
+
+    The function NEVER exceeds MAX_KELLY_RISK_PCT.
+
+    Quantity is always rounded DOWN to complete lots.
     """
-    capital = max(0.0, _finite(capital))
-    entry = max(0.0, _finite(entry))
-    stop = max(0.0, _finite(stop))
-    reward = max(0.0, _finite(reward))
-    lot_size = max(1, int(_finite(lot_size, 1)))
 
-    risk_per_unit = entry - stop
+    capital = max(
+        0.0,
+        _finite(capital),
+    )
+
+    entry = max(
+        0.0,
+        _finite(entry),
+    )
+
+    stop = max(
+        0.0,
+        _finite(stop),
+    )
+
+    reward = max(
+        0.0,
+        _finite(reward),
+    )
+
+    probability = clamp(
+        probability,
+        0.0,
+        1.0,
+    )
+
+    try:
+        lot_size = int(
+            _finite(
+                lot_size,
+                1,
+            )
+        )
+    except (TypeError, ValueError):
+        lot_size = 1
+
+    lot_size = max(
+        1,
+        lot_size,
+    )
+
+    # --------------------------------------------------------
+    # Stop distance
+    # --------------------------------------------------------
+
+    risk_per_unit = (
+        entry - stop
+    )
+
+    # --------------------------------------------------------
+    # Invalid trade
+    # --------------------------------------------------------
 
     if (
         capital <= 0
@@ -326,16 +956,50 @@ def calculate_position_size(
             "risk_per_unit": risk_per_unit,
             "planned_risk": 0.0,
             "risk_pct": 0.0,
+            "kelly_theoretical": 0.0,
+            "kelly_fraction_used": KELLY_FRACTION,
+            "regime_multiplier": regime_risk_multiplier(
+                regime
+            ),
+            "drawdown_multiplier": drawdown_multiplier(
+                drawdown_pct
+            ),
+            "effective_risk_pct": 0.0,
         }
 
-    regime_mult = regime_risk_multiplier(regime)
-    drawdown_mult = drawdown_multiplier(drawdown_pct)
+    # --------------------------------------------------------
+    # Regime and drawdown
+    # --------------------------------------------------------
 
-    hard_risk_pct = (
-        MAX_KELLY_RISK_PCT
-        * regime_mult
-        * drawdown_mult
+    regime_mult = regime_risk_multiplier(
+        regime
     )
+
+    drawdown_mult = drawdown_multiplier(
+        drawdown_pct
+    )
+
+    # No capital risk in a blocked regime/drawdown.
+    if (
+        regime_mult <= 0
+        or drawdown_mult <= 0
+    ):
+        return {
+            "quantity": 0,
+            "lots": 0,
+            "risk_per_unit": risk_per_unit,
+            "planned_risk": 0.0,
+            "risk_pct": 0.0,
+            "kelly_theoretical": 0.0,
+            "kelly_fraction_used": KELLY_FRACTION,
+            "regime_multiplier": regime_mult,
+            "drawdown_multiplier": drawdown_mult,
+            "effective_risk_pct": 0.0,
+        }
+
+    # --------------------------------------------------------
+    # Kelly
+    # --------------------------------------------------------
 
     theoretical_kelly = kelly_fraction(
         probability,
@@ -343,38 +1007,144 @@ def calculate_position_size(
         risk_per_unit,
     )
 
-    kelly_risk_pct = min(
-        MAX_KELLY_RISK_PCT,
-        theoretical_kelly * KELLY_FRACTION,
+    # No positive mathematical edge.
+    #
+    # Do NOT fall back to the hard risk ceiling.
+    if theoretical_kelly <= 0:
+        return {
+            "quantity": 0,
+            "lots": 0,
+            "risk_per_unit": risk_per_unit,
+            "planned_risk": 0.0,
+            "risk_pct": 0.0,
+            "kelly_theoretical": theoretical_kelly,
+            "kelly_fraction_used": KELLY_FRACTION,
+            "regime_multiplier": regime_mult,
+            "drawdown_multiplier": drawdown_mult,
+            "effective_risk_pct": 0.0,
+        }
+
+    # --------------------------------------------------------
+    # Hard account risk ceiling
+    # --------------------------------------------------------
+
+    max_risk_pct = max(
+        0.0,
+        _finite(MAX_KELLY_RISK_PCT),
     )
 
-    # Never allow Kelly to increase risk above the hard ceiling.
+    hard_risk_pct = (
+        max_risk_pct
+        * regime_mult
+        * drawdown_mult
+    )
+
+    # --------------------------------------------------------
+    # Fractional Kelly risk
+    # --------------------------------------------------------
+
+    fractional_kelly = (
+        theoretical_kelly
+        * clamp(
+            KELLY_FRACTION,
+            0.0,
+            1.0,
+        )
+    )
+
+    kelly_risk_pct = min(
+        max_risk_pct,
+        fractional_kelly,
+    )
+
+    # --------------------------------------------------------
+    # Final risk
+    # --------------------------------------------------------
+
     effective_risk_pct = min(
         hard_risk_pct,
-        kelly_risk_pct if kelly_risk_pct > 0 else hard_risk_pct,
+        kelly_risk_pct,
     )
 
-    max_risk_money = capital * effective_risk_pct
+    effective_risk_pct = max(
+        0.0,
+        effective_risk_pct,
+    )
 
-    raw_quantity = max_risk_money / risk_per_unit
-    lots = int(raw_quantity // lot_size)
-    quantity = lots * lot_size
+    # --------------------------------------------------------
+    # Maximum monetary risk
+    # --------------------------------------------------------
 
-    planned_risk = quantity * risk_per_unit
+    max_risk_money = (
+        capital
+        * effective_risk_pct
+    )
+
+    if max_risk_money <= 0:
+        return {
+            "quantity": 0,
+            "lots": 0,
+            "risk_per_unit": risk_per_unit,
+            "planned_risk": 0.0,
+            "risk_pct": 0.0,
+            "kelly_theoretical": theoretical_kelly,
+            "kelly_fraction_used": KELLY_FRACTION,
+            "regime_multiplier": regime_mult,
+            "drawdown_multiplier": drawdown_mult,
+            "effective_risk_pct": 0.0,
+        }
+
+    # --------------------------------------------------------
+    # Quantity
+    # --------------------------------------------------------
+
+    raw_quantity = (
+        max_risk_money
+        / risk_per_unit
+    )
+
+    # Always round DOWN.
+    lots = int(
+        raw_quantity // lot_size
+    )
+
+    quantity = (
+        lots
+        * lot_size
+    )
+
+    # --------------------------------------------------------
+    # Actual planned risk
+    # --------------------------------------------------------
+
+    planned_risk = (
+        quantity
+        * risk_per_unit
+    )
+
+    actual_risk_pct = (
+        planned_risk / capital
+        if capital > 0
+        else 0.0
+    )
 
     return {
         "quantity": quantity,
         "lots": lots,
+
         "risk_per_unit": risk_per_unit,
+
         "planned_risk": planned_risk,
-        "risk_pct": (
-            planned_risk / capital
-            if capital > 0
-            else 0.0
-        ),
+
+        "risk_pct": actual_risk_pct,
+
         "kelly_theoretical": theoretical_kelly,
+
         "kelly_fraction_used": KELLY_FRACTION,
+
         "regime_multiplier": regime_mult,
+
         "drawdown_multiplier": drawdown_mult,
+
         "effective_risk_pct": effective_risk_pct,
     }

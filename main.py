@@ -40,6 +40,7 @@ from risk_engine import (
     classify_regime,
     effective_probability,
     evaluate_trade,
+    timeframe_alignment,
 )
 from orders import (
     select_best_option,
@@ -535,7 +536,85 @@ def get_instrument_data(instrument_config):
         )
         return pd.DataFrame()
 
+def get_5min_instrument_data(df):
+    """
+    Convert 1-minute underlying candles into 5-minute candles.
 
+    The original 1-minute dataframe is never modified.
+    """
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    if not isinstance(df.index, pd.DatetimeIndex):
+        return pd.DataFrame()
+
+    required = {"open", "high", "low", "close"}
+
+    if not required.issubset(df.columns):
+        return pd.DataFrame()
+
+    working = df.copy().sort_index()
+
+    aggregation = {
+        "open": "first",
+        "high": "max",
+        "low": "min",
+        "close": "last",
+    }
+
+    if "volume" in working.columns:
+        aggregation["volume"] = "sum"
+
+    result = (
+        working
+        .resample("5min", label="right", closed="right")
+        .agg(aggregation)
+        .dropna(subset=["open", "high", "low", "close"])
+    )
+
+    return result
+
+def remove_stale_candles(df, min_run=5):
+    """
+    Remove candles that are part of a prolonged identical OHLCV run.
+
+    A candle is considered stale when OHLCV is identical to the previous
+    candle for at least `min_run` consecutive candles.
+
+    The original dataframe is never modified.
+    """
+    if df is None or df.empty:
+        return pd.DataFrame() if df is None else df.copy()
+
+    required = {"open", "high", "low", "close"}
+
+    if not required.issubset(df.columns):
+        return df.copy()
+
+    result = df.copy()
+
+    comparison_columns = [
+        "open",
+        "high",
+        "low",
+        "close",
+    ]
+
+    if "volume" in result.columns:
+        comparison_columns.append("volume")
+
+    same_as_previous = result[comparison_columns].eq(
+        result[comparison_columns].shift(1)
+    ).all(axis=1)
+
+    # Build consecutive identical-candle runs.
+    groups = (same_as_previous != same_as_previous.shift()).cumsum()
+
+    run_length = same_as_previous.groupby(groups).transform("sum")
+
+    stale_mask = same_as_previous & (run_length >= min_run)
+
+    return result.loc[~stale_mask].copy()
 # ============================================================
 # MARKET ANALYSIS
 # ============================================================
@@ -888,23 +967,70 @@ def analyze_market(df, instrument_name="NIFTY"):
 
     return market
 
+def analyze_regime_5m(df, instrument_name="NIFTY"):
+    """
+    Build a 5-minute market-context snapshot.
 
+    This is a higher-timeframe filter only.
+    It does not replace the existing 1-minute market analysis.
+    """
+    if df is None or df.empty:
+        return None
+
+    try:
+        df_5m = get_5min_instrument_data(df)
+
+        if df_5m.empty:
+            return None
+
+        # Remove prolonged stale OHLCV runs only for the
+        # higher-timeframe context calculation.
+        df_5m_clean = remove_stale_candles(
+            df_5m,
+            min_run=2,
+        )
+
+        if len(df_5m_clean) < 200:
+            return None
+
+        return analyze_market(
+            df_5m_clean,
+            instrument_name,
+        )
+
+    except Exception as exc:
+        log(
+            f"{instrument_name}: 5M regime analysis failed: "
+            + str(exc)
+        )
+        return None
 # ============================================================
 # OPTION CHAIN
 # ============================================================
-
 def get_nearest_expiry(security_id):
     if not dhan:
         return None
 
     try:
-        response = dhan.get_expiry_list(
-            underlying_security_id=int(security_id),
-            underlying_type="INDEX",
+        response = dhan.expiry_list(
+            under_security_id=int(security_id),
+            under_exchange_segment="IDX_I",
         )
 
         if isinstance(response, dict):
-            data = response.get("data", [])
+            outer_data = response.get("data", {})
+
+            # Dhan returns:
+            # {
+            #     "data": {
+            #         "data": [...expiry dates...],
+            #         "status": "success"
+            #     }
+            # }
+            if isinstance(outer_data, dict):
+                data = outer_data.get("data", [])
+            else:
+                data = outer_data
 
             if isinstance(data, list) and data:
                 return data[0]
@@ -920,10 +1046,31 @@ def get_option_chain(security_id, expiry):
         return None
 
     try:
-        return dhan.get_option_chain(
-            underlying_security_id=int(security_id),
+        response = dhan.option_chain(
+            under_security_id=int(security_id),
+            under_exchange_segment="IDX_I",
             expiry=expiry,
         )
+
+        # Dhan returns:
+        # response["data"]["data"]["oc"]
+        #
+        # Return the option-chain strike dictionary directly
+        # because parse_option_chain() already knows how to
+        # process strike -> CE/PE structures.
+        if isinstance(response, dict):
+            outer_data = response.get("data", {})
+
+            if isinstance(outer_data, dict):
+                inner_data = outer_data.get("data", {})
+
+                if isinstance(inner_data, dict):
+                    oc = inner_data.get("oc")
+
+                    if isinstance(oc, dict):
+                        return oc
+
+        return None
 
     except Exception as exc:
         log("Option-chain lookup failed: " + str(exc))
@@ -1593,6 +1740,44 @@ def run():
         )
 
         if market is None:
+            continue
+        regime_market = analyze_regime_5m(
+            df,
+            instrument_name,
+         )
+        if regime_market is None:
+            log(
+                f"{instrument_name}: 5M regime unavailable"
+            )
+            continue
+
+        log(
+            f"{instrument_name} | 5M "
+            f"{regime_market['direction']} | "
+            f"Regime={regime_market['regime']} | "
+            f"Score={regime_market['score']} | "
+            f"Confidence={regime_market['confidence']:.2f}"
+        )
+
+        alignment = timeframe_alignment(
+            market["direction"],
+            regime_market["direction"],
+            regime_market["regime"],
+        )
+
+        log(
+            f"{instrument_name} | "
+            f"1M={market['direction']} | "
+            f"5M={regime_market['direction']} | "
+            f"ALIGNMENT={alignment['action']} | "
+            f"{alignment['reason']}"
+        )
+
+        if not alignment["aligned"]:
+            log(
+                f"{instrument_name}: "
+                f"5M/1M conflict — waiting for alignment"
+            )
             continue
 
         if market["score"] < MIN_SIGNAL_SCORE:
