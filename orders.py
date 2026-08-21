@@ -1,4 +1,3 @@
-import math
 """
 Order management for Athena-X - With Trailing Stop-Loss
 """
@@ -6,6 +5,8 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 from config import *
 from telegram import telegram
+from logger import log
+from database import db
 
 IST = ZoneInfo("Asia/Kolkata")
 
@@ -31,24 +32,10 @@ def get_option_ltp(option):
 
 def get_option_delta(option):
     try:
-        if not isinstance(option, dict):
-            return 0.0
-
-        greeks = option.get("greeks", {})
-
-        if isinstance(greeks, dict):
-            val = greeks.get("delta")
-
-            if val is not None:
-                return float(val)
-
-        # Compatibility with flat option-chain formats.
-        val = safe_get(option, ["delta"])
-
-        return float(val) if val is not None else 0.0
-
-    except (TypeError, ValueError):
-        return 0.0
+        val = safe_get(option, ['delta'])
+        return float(val) if val else 0
+    except Exception:
+        return 0
 
 def get_option_oi(option):
     try:
@@ -206,7 +193,7 @@ def select_best_option(chain_df, market, instrument_name="NIFTY"):
     The returned candidate structure is kept compatible with the
     downstream trade/execution pipeline.
     """
-    from logger import log
+    
 
     if chain_df is None or chain_df.empty:
         return None
@@ -624,11 +611,9 @@ def select_best_option(chain_df, market, instrument_name="NIFTY"):
         + " | Score: "
         + f"{best['score']:.2f}"
     )
-
     return best
 
 def execute_trade(dhan, market, candidate, trade, logger, state, ml_engine=None):
-    from logger import log
     
     instrument = trade.get('instrument', 'NIFTY')
     
@@ -712,7 +697,12 @@ def execute_trade(dhan, market, candidate, trade, logger, state, ml_engine=None)
         'trailing_stop': trailing_data if TRAILING_STOP_ENABLED else None,
         'last_update_time': datetime.now(IST).isoformat()
     }
-    
+        # Persist the active trade so paper/live state survives restarts.
+    try:
+        db.save_active_trade(state['active_trade'])
+    except Exception as exc:
+        log("Database: failed to save active trade - " + str(exc))
+        
     if not LIVE_TRADING:
         log("PAPER MODE — NO REAL ORDER")
         telegram.send_status("PAPER TRADE: " + instrument + " " + candidate['option_type'] + " " + str(candidate['strike']))
@@ -744,11 +734,13 @@ def execute_trade(dhan, market, candidate, trade, logger, state, ml_engine=None)
 # ============================================================
 
 def update_trailing_stop(active, current_price):
+    
     """
     Update trailing stop using the traded option LTP.
 
     The underlying/index price is never used here.
     """
+    
     if not active or not TRAILING_STOP_ENABLED:
         return
 

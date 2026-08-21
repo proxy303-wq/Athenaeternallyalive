@@ -39,8 +39,6 @@ from config import (
     LOW_VOL_ATR_PCT,
     MAX_DRAWDOWN_RISK_REDUCTION,
     MAX_KELLY_RISK_PCT,
-    MAX_VOLATILITY,
-    MIN_VOLATILITY,
     RANGE_ADX_THRESHOLD,
     SLIPPAGE_PCT,
     TRANSACTION_COST_PCT,
@@ -753,6 +751,52 @@ def evaluate_trade(
             1.0,
         )
     )
+
+    # --------------------------------------------------------
+    # Approval gates
+    # --------------------------------------------------------
+
+    approved = True
+    reason = "APPROVED"
+
+    if regime == "UNKNOWN":
+        approved = False
+        reason = "UNKNOWN_REGIME"
+
+    elif drawdown_mult <= 0:
+        approved = False
+        reason = "DRAWDOWN_STOP"
+
+    elif regime_mult <= 0:
+        approved = False
+        reason = "REGIME_REJECTED"
+
+    elif ev_per_risk < EV_MIN_PER_RISK:
+        approved = False
+        reason = "NEGATIVE_OR_WEAK_EV"
+
+    elif kelly <= 0:
+        approved = False
+        reason = "NO_POSITIVE_KELLY_EDGE"
+
+    return {
+        "approved": approved,
+        "reason": reason,
+        "regime": regime,
+        "probability": probability,
+        "reward": reward,
+        "risk": risk,
+        "costs": estimated_costs,
+        "expected_value": ev,
+        "expected_value_per_risk": ev_per_risk,
+        "kelly_fraction": kelly,
+        "fractional_kelly": fractional_kelly,
+        "drawdown_multiplier": drawdown_mult,
+        "regime_multiplier": regime_mult,
+        "risk_multiplier": total_risk_multiplier,
+        "max_kelly_risk_pct": MAX_KELLY_RISK_PCT,
+    }
+
 def timeframe_alignment(
     entry_direction,
     regime_direction,

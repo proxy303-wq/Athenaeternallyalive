@@ -1165,9 +1165,11 @@ def parse_option_chain(response):
 
 def get_live_option_price(active_trade):
     """
-    Fetch the traded OPTION's LTP.
+    Fetch the traded OPTION's LTP from the Dhan option-chain data.
 
-    This function is intentionally separate from get_instrument_data().
+    The Dhan ohlc_data() endpoint has proven unreliable for these
+    NSE_FNO option contracts, while get_option_chain() provides the
+    contract LTP directly.
     """
     if not active_trade:
         return None
@@ -1178,55 +1180,72 @@ def get_live_option_price(active_trade):
         return None
 
     if not dhan:
-        # Paper mode cannot obtain a broker quote without a data source.
-        # Do not substitute the underlying index price.
         return None
 
     try:
-        # Dhan quote API response shapes vary by SDK version.
-        response = dhan.ohlc_data(
-            securities={
-                "NSE_FNO": [str(security_id)]
-            }
-        )
+        instrument = active_trade.get("instrument", "NIFTY")
+        instrument_config = INSTRUMENTS.get(instrument)
 
-        if not isinstance(response, dict):
+        if not instrument_config:
             return None
 
-        data = response.get("data", response)
+        underlying_security_id = instrument_config["security_id"]
 
-        if isinstance(data, dict):
-            instrument_data = data.get("NSE_FNO")
+        expiry = get_nearest_expiry(
+            underlying_security_id
+        )
 
-            # Dhan commonly nests the security ID one level below the
-            # exchange segment: {"NSE_FNO": {"22222": {...}}}.
-            if isinstance(instrument_data, dict):
-                nested = (
-                    instrument_data.get(str(security_id))
-                    or instrument_data.get(int(security_id))
-                    if str(security_id).isdigit()
-                    else instrument_data.get(str(security_id))
+        if not expiry:
+            return None
+
+        chain = get_option_chain(
+            underlying_security_id,
+            expiry,
+        )
+
+        if not isinstance(chain, dict):
+            return None
+
+        target_security_id = str(security_id)
+
+        for strike, row in chain.items():
+
+            if not isinstance(row, dict):
+                continue
+
+            for option_type in ("ce", "pe"):
+
+                option = row.get(option_type)
+
+                if not isinstance(option, dict):
+                    continue
+
+                option_security_id = str(
+                    option.get("security_id", "")
                 )
 
-                if isinstance(nested, dict):
-                    instrument_data = nested
+                if option_security_id != target_security_id:
+                    continue
 
-                for key in ("last_price", "ltp", "LTP", "close"):
-                    value = _safe_float(instrument_data.get(key))
+                ltp = _safe_float(
+                    option.get("last_price")
+                )
 
-                    if value is not None and value > 0:
-                        return value
+                if ltp is not None and ltp > 0:
+                    return ltp
 
-            # Also support a flat response keyed directly by security ID.
-            flat = data.get(str(security_id))
+        log(
+            f"Option LTP unavailable for "
+            f"security ID {security_id}"
+        )
 
-            if isinstance(flat, dict):
-                for key in ("last_price", "ltp", "LTP", "close"):
-                    value = _safe_float(flat.get(key))
+        return None
 
-                    if value is not None and value > 0:
-                        return value
-
+    except Exception as exc:
+        log(
+            "Option LTP lookup failed: "
+            + str(exc)
+        )
         return None
 
     except Exception as exc:
@@ -1617,15 +1636,14 @@ def reset_state():
     )
 
     if STATE["date"] != current_date:
-        STATE["date"] = current_date
-        STATE["trades_today"] = 0
-        STATE["realized_pnl_today"] = 0.0
-        STATE["active_trade"] = None
-        STATE["daily_returns"] = []
-        STATE["sharpe_ratio"] = 0.0
-        STATE["last_report_date"] = None
+     STATE["date"] = current_date
+    STATE["trades_today"] = 0
+    STATE["realized_pnl_today"] = 0.0
+    STATE["daily_returns"] = []
+    STATE["sharpe_ratio"] = 0.0
+    STATE["last_report_date"] = None
 
-        log("New trading day")
+    log("New trading day")
 
     if STATE["month_start"] != current_month:
         STATE["month_start"] = current_month
@@ -1801,19 +1819,35 @@ def run():
             )
             continue
 
-        atr_percent = (
-            market["atr"] / market["price"] * 100
-            if market["price"] > 0
-            else 0
-        )
+                # ----------------------------------------------------
+        # Volatility is evaluated through the higher-timeframe
+        # regime classification.
+        #
+        # LOW_VOL_RANGE:
+        #     Avoid entries because price action lacks sufficient
+        #     directional expansion.
+        #
+        # TRENDING:
+        #     Allow the setup to continue through the remaining
+        #     entry gates.
+        #
+        # HIGH_VOL:
+        #     Avoid entries because execution/risk conditions are
+        #     elevated.
+        # ----------------------------------------------------
+        regime = regime_market.get("regime")
 
-        if (
-            atr_percent > MAX_VOLATILITY
-            or atr_percent < MIN_VOLATILITY
-        ):
+        if regime == "LOW_VOL_RANGE":
             log(
-                f"{instrument_name}: volatility "
-                f"{atr_percent:.2f}% outside limits"
+                f"{instrument_name}: 5M regime LOW_VOL_RANGE "
+                "— waiting for directional expansion"
+            )
+            continue
+
+        if regime == "HIGH_VOL":
+            log(
+                f"{instrument_name}: 5M regime HIGH_VOL "
+                "— waiting for volatility to normalize"
             )
             continue
 
@@ -2113,7 +2147,7 @@ def run():
             break
 
 
-persist_state()
+
 
 # ============================================================
 # STARTUP
